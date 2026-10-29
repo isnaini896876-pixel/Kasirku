@@ -1,0 +1,8 @@
+{
+  "name": "Kasir Cetak Struk - Token, Transfer, QRIS & Toko",
+  "description": "Aplikasi kasir cetak struk thermal Bluetooth universal untuk Token PLN, Transfer Bank, QRIS Pay, dan Toko Retail dengan OCR AI dan suara.",
+  "requestFramePermissions": [
+    "bluetooth"
+  ],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
