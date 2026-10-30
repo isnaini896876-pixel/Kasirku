@@ -93,6 +93,29 @@ export const BleNoticeModal: React.FC<BleNoticeModalProps> = ({
               <span>Buka Dialog Cetak Browser</span>
             </button>
           </div>
+
+          {/* Opsi 3: Buka Tab Penuh (Direct BLE) */}
+          <div className="border border-indigo-200 bg-indigo-50/60 p-3 rounded-xl space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="font-extrabold text-indigo-950 text-xs flex items-center gap-1.5">
+                <ExternalLink className="w-4 h-4 text-indigo-600" />
+                <span>Solusi 3: Buka di Tab Baru Chrome</span>
+              </span>
+            </div>
+            <p className="text-[11px] text-indigo-900/80">
+              Membuka aplikasi di tab baru mandiri menghapus batasan iframe sehingga Web Bluetooth dapat langsung memindai printer Anda.
+            </p>
+            <button
+              onClick={() => {
+                onClose();
+                window.open(window.location.href, '_blank');
+              }}
+              className="w-full flex items-center justify-center gap-1.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-3 rounded-lg text-xs shadow-xs transition"
+            >
+              <ExternalLink className="w-3.5 h-3.5" />
+              <span>Buka di Tab Baru Chrome</span>
+            </button>
+          </div>
         </div>
 
         <div className="p-3 border-t border-slate-100 bg-slate-50 flex justify-end">

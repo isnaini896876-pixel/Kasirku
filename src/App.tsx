@@ -7,6 +7,8 @@ import {
   TokoData,
   StoreSettings,
   ReceiptHistoryItem,
+  MasterQrisConfig,
+  QrisMerchantAccount,
 } from './types';
 import { Header } from './components/Header';
 import { BluetoothBar } from './components/BluetoothBar';
@@ -21,19 +23,79 @@ import { PrinterGuideModal } from './components/PrinterGuideModal';
 import { StoreSettingsModal } from './components/StoreSettingsModal';
 import { HistoryDrawer } from './components/HistoryDrawer';
 import { BleNoticeModal } from './components/BleNoticeModal';
+import { QrisDisplayModal } from './components/QrisDisplayModal';
+import { OnlineShareModal } from './components/OnlineShareModal';
+import { ShareGuideModal } from './components/ShareGuideModal';
 import { ToastContainer, ToastMessage } from './components/Toast';
+import { PWAInstallButton } from './components/PWAInstallButton';
 import { getCurrentIndonesianDateTime, formatToken20 } from './utils/formatters';
+import {
+  generateStandardQris,
+  convertToDynamicQris,
+  convertToStaticQris,
+  SAMPLE_QRIS_PRESETS,
+} from './utils/qris';
+import { useShareTarget } from './hooks/useShareTarget';
 import {
   connectBlePrinter,
   disconnectBlePrinter,
   globalBleState,
   EscPosBuilder,
   buildEscPosReceipt,
+  buildQrisStandeeReceipt,
+  buildAllQrisStandeesReceipt,
   printViaRawBt,
   printViaBle,
   BlePermissionError,
 } from './utils/printer';
 import { playChimeSound, announceTransaction } from './utils/sound';
+import { useOnlineStatus } from './hooks/useOnlineStatus';
+
+const DEFAULT_QRIS_MERCHANTS: QrisMerchantAccount[] = [
+  {
+    id: 'merchant_1',
+    merchantName: 'KONTER BERKAH CELL',
+    nmid: 'ID1020039281921',
+    acquirer: 'BCA QRIS',
+    city: 'JAKARTA',
+    qrisPayload: SAMPLE_QRIS_PRESETS[0].samplePayload,
+    isDefault: true,
+    notes: 'Kasir Utama & Counter Depan',
+    createdAt: new Date().toISOString(),
+  },
+  {
+    id: 'merchant_2',
+    merchantName: 'WARUNG KOPI & SNACK',
+    nmid: 'ID1020083921029',
+    acquirer: 'DANA BISNIS',
+    city: 'SURABAYA',
+    qrisPayload: SAMPLE_QRIS_PRESETS[1].samplePayload,
+    isDefault: false,
+    notes: 'Khusus Pesanan Kopi & Makanan Ringan',
+    createdAt: new Date().toISOString(),
+  },
+  {
+    id: 'merchant_3',
+    merchantName: 'WARUNG DIGITAL SERBA ADA',
+    nmid: 'ID1020094829103',
+    acquirer: 'SHOPEEPAY MERCHANT',
+    city: 'BANDUNG',
+    qrisPayload: SAMPLE_QRIS_PRESETS[2].samplePayload,
+    isDefault: false,
+    notes: 'Toko Kelontong & Sembako',
+    createdAt: new Date().toISOString(),
+  },
+];
+
+const DEFAULT_MASTER_QRIS: MasterQrisConfig = {
+  merchantName: DEFAULT_QRIS_MERCHANTS[0].merchantName,
+  nmid: DEFAULT_QRIS_MERCHANTS[0].nmid,
+  acquirer: DEFAULT_QRIS_MERCHANTS[0].acquirer,
+  city: DEFAULT_QRIS_MERCHANTS[0].city,
+  qrisPayload: DEFAULT_QRIS_MERCHANTS[0].qrisPayload,
+  isConfigured: true,
+  savedAt: new Date().toISOString(),
+};
 
 const DEFAULT_SETTINGS: StoreSettings = {
   storeName: 'KONTER BERKAH CELL',
@@ -46,6 +108,9 @@ const DEFAULT_SETTINGS: StoreSettings = {
   soundEnabled: true,
   autoAnnounceOnPrint: true,
   showBarcode: true,
+  masterQris: DEFAULT_MASTER_QRIS,
+  qrisMerchants: DEFAULT_QRIS_MERCHANTS,
+  activeQrisMerchantId: DEFAULT_QRIS_MERCHANTS[0].id,
 };
 
 export default function App() {
@@ -72,6 +137,52 @@ export default function App() {
     }
   });
 
+  // Master QRIS Permanent Configuration (saved in localStorage)
+  const [masterQris, setMasterQris] = useState<MasterQrisConfig>(() => {
+    try {
+      const savedMaster = localStorage.getItem('kasir_struk_master_qris');
+      if (savedMaster) {
+        return JSON.parse(savedMaster);
+      }
+      const savedSettings = localStorage.getItem('kasir_struk_settings');
+      if (savedSettings) {
+        const parsed = JSON.parse(savedSettings);
+        if (parsed.masterQris) return parsed.masterQris;
+      }
+      return DEFAULT_MASTER_QRIS;
+    } catch {
+      return DEFAULT_MASTER_QRIS;
+    }
+  });
+
+  // Online Cloud Connection & Heartbeat
+  const { isOnline, serverStatus, latency, checkNow } = useOnlineStatus();
+  const [showOnlineModal, setShowOnlineModal] = useState(false);
+
+  // Saved QRIS Merchant Accounts (saved in localStorage)
+  const [qrisMerchants, setQrisMerchants] = useState<QrisMerchantAccount[]>(() => {
+    try {
+      const saved = localStorage.getItem('kasir_struk_qris_merchants');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+    } catch (e) {
+      console.warn('Failed to load saved merchants', e);
+    }
+    return DEFAULT_QRIS_MERCHANTS;
+  });
+
+  const [activeQrisMerchantId, setActiveQrisMerchantId] = useState<string>(() => {
+    try {
+      const savedId = localStorage.getItem('kasir_struk_active_merchant_id');
+      if (savedId) return savedId;
+    } catch {}
+    return DEFAULT_QRIS_MERCHANTS[0].id;
+  });
+
+  const [settingsModalInitialTab, setSettingsModalInitialTab] = useState<'profil' | 'qris'>('profil');
+
   // Bluetooth BLE Connection State
   const [bleConnected, setBleConnected] = useState(false);
   const [bleDeviceName, setBleDeviceName] = useState('Kompatibel Semua Merek');
@@ -82,6 +193,9 @@ export default function App() {
   const [showGuideModal, setShowGuideModal] = useState(false);
   const [showHistoryModal, setShowHistoryModal] = useState(false);
   const [showBleNoticeModal, setShowBleNoticeModal] = useState(false);
+  const [showQrModal, setShowQrModal] = useState(false);
+  const [showShareGuideModal, setShowShareGuideModal] = useState(false);
+  const [sharedFileToProcess, setSharedFileToProcess] = useState<File | null>(null);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
 
   const addToast = (message: string, type: 'success' | 'error' | 'warning' | 'info' = 'info') => {
@@ -95,6 +209,15 @@ export default function App() {
   const dismissToast = (id: string) => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   };
+
+  // Web Share Target: listen for images shared from other Android apps (Bank, E-Wallet, WA)
+  useShareTarget({
+    onImageReceived: (file) => {
+      setSharedFileToProcess(file);
+      addToast('Menerima gambar bukti transaksi dari menu Bagikan (Share)! Memproses...', 'info');
+    },
+    onNotify: addToast,
+  });
 
   // ================= FORM STATES =================
   // Tab 1: Token PLN
@@ -119,6 +242,9 @@ export default function App() {
     waktu: getCurrentIndonesianDateTime(),
     refNo: 'TRX' + Math.floor(Math.random() * 900000 + 100000),
     bankPengirim: 'BCA',
+    namaPengirim: 'KONTER BERKAH',
+    kategoriPengirim: 'Rekening Utama Toko',
+    tampilkanRekeningPengirim: true,
     bankTujuan: 'BRI',
     rekeningPengirim: '8291029381',
     sensorRekening: true,
@@ -132,20 +258,34 @@ export default function App() {
     total: 105000,
     status: 'BERHASIL',
     catatan: 'Pembayaran tagihan',
+    tampilkanCatatan: true,
   });
 
-  // Tab 3: QRIS Pay
-  const [qrisData, setQrisData] = useState<QrisData>({
-    waktu: getCurrentIndonesianDateTime(),
-    refNo: 'QR' + Math.floor(Math.random() * 90000000 + 10000000),
-    merchantName: settings.storeName || 'KONTER BERKAH',
-    nmid: 'ID1020039281921',
-    acquirer: 'SHOPEEPAY',
-    customerName: 'AHMAD FAUZI',
-    nominal: 25000,
-    fee: 0,
-    total: 25000,
-    status: 'SUKSES DITERIMA',
+  // Tab 3: QRIS Pay (Dinamis & Statis - Loaded from permanent master)
+  const [qrisData, setQrisData] = useState<QrisData>(() => {
+    const store = masterQris.merchantName || settings.storeName || 'KONTER BERKAH CELL';
+    const nmid = masterQris.nmid || 'ID1020039281921';
+    const nominal = 25000;
+    const initialPayload = masterQris.qrisPayload
+      ? convertToDynamicQris(masterQris.qrisPayload, nominal, 'QR' + Math.floor(Math.random() * 90000 + 10000))
+      : generateStandardQris(store, nmid, masterQris.city || 'JAKARTA', true, nominal);
+
+    return {
+      waktu: getCurrentIndonesianDateTime(),
+      refNo: 'QR' + Math.floor(Math.random() * 90000000 + 10000000),
+      merchantName: store,
+      nmid,
+      acquirer: masterQris.acquirer || 'QRIS NASIONAL',
+      customerName: 'PELANGGAN UMUM',
+      nominal,
+      fee: 0,
+      total: nominal,
+      status: 'SUKSES DITERIMA',
+      qrisType: 'dinamis',
+      qrisPayload: initialPayload,
+      printQrOnReceipt: true,
+      city: masterQris.city || 'JAKARTA',
+    };
   });
 
   // Tab 4: Toko & Suara
@@ -187,7 +327,197 @@ export default function App() {
 
   // Update Settings
   const handleUpdateSettings = (newSettings: Partial<StoreSettings>) => {
-    setSettings((prev) => ({ ...prev, ...newSettings }));
+    setSettings((prev) => {
+      const updated = { ...prev, ...newSettings };
+      if (newSettings.masterQris) {
+        setMasterQris(newSettings.masterQris);
+        try {
+          localStorage.setItem('kasir_struk_master_qris', JSON.stringify(newSettings.masterQris));
+        } catch {}
+      }
+      return updated;
+    });
+  };
+
+  // Save permanent Master QRIS to localStorage and propagate to active QRIS
+  const handleSaveMasterQris = (newMaster: MasterQrisConfig) => {
+    setMasterQris(newMaster);
+    try {
+      localStorage.setItem('kasir_struk_master_qris', JSON.stringify(newMaster));
+      setSettings((prev) => {
+        const updated = { ...prev, masterQris: newMaster };
+        localStorage.setItem('kasir_struk_settings', JSON.stringify(updated));
+        return updated;
+      });
+    } catch (e) {
+      console.warn('Failed to save master QRIS', e);
+    }
+
+    // Immediately sync active qrisData
+    setQrisData((prev) => {
+      const isDynamic = prev.qrisType === 'dinamis';
+      const targetNominal = prev.total > 0 ? prev.total : prev.nominal;
+      let newPayload = newMaster.qrisPayload;
+      try {
+        if (isDynamic) {
+          newPayload = convertToDynamicQris(newMaster.qrisPayload, targetNominal > 0 ? targetNominal : 1, prev.refNo);
+        } else {
+          newPayload = convertToStaticQris(newMaster.qrisPayload);
+        }
+      } catch {
+        newPayload = newMaster.qrisPayload;
+      }
+
+      return {
+        ...prev,
+        merchantName: newMaster.merchantName,
+        nmid: newMaster.nmid,
+        acquirer: newMaster.acquirer,
+        city: newMaster.city,
+        qrisPayload: newPayload,
+      };
+    });
+
+    addToast(`QRIS Toko "${newMaster.merchantName}" berhasil disimpan permanen!`, 'success');
+  };
+
+  // Save qrisMerchants to localStorage on change
+  useEffect(() => {
+    try {
+      localStorage.setItem('kasir_struk_qris_merchants', JSON.stringify(qrisMerchants));
+    } catch (e) {
+      console.warn('LocalStorage error:', e);
+    }
+  }, [qrisMerchants]);
+
+  // Select active merchant account
+  const handleSelectQrisMerchant = (merchant: QrisMerchantAccount) => {
+    setActiveQrisMerchantId(merchant.id);
+    try {
+      localStorage.setItem('kasir_struk_active_merchant_id', merchant.id);
+    } catch {}
+
+    const newMaster: MasterQrisConfig = {
+      merchantName: merchant.merchantName,
+      nmid: merchant.nmid,
+      acquirer: merchant.acquirer,
+      city: merchant.city,
+      qrisPayload: merchant.qrisPayload,
+      isConfigured: true,
+      savedAt: new Date().toISOString(),
+    };
+    setMasterQris(newMaster);
+    try {
+      localStorage.setItem('kasir_struk_master_qris', JSON.stringify(newMaster));
+    } catch {}
+
+    setQrisData((prev) => {
+      const isDynamic = prev.qrisType === 'dinamis';
+      const targetNominal = prev.total > 0 ? prev.total : prev.nominal;
+      let newPayload = merchant.qrisPayload;
+      try {
+        if (isDynamic) {
+          newPayload = convertToDynamicQris(merchant.qrisPayload, targetNominal > 0 ? targetNominal : 1, prev.refNo);
+        } else {
+          newPayload = convertToStaticQris(merchant.qrisPayload);
+        }
+      } catch {
+        newPayload = merchant.qrisPayload;
+      }
+
+      return {
+        ...prev,
+        merchantName: merchant.merchantName,
+        nmid: merchant.nmid,
+        acquirer: merchant.acquirer,
+        city: merchant.city,
+        qrisPayload: newPayload,
+      };
+    });
+
+    addToast(`Akun QRIS beralih ke "${merchant.merchantName}" (${merchant.acquirer})!`, 'success');
+  };
+
+  const handleAddQrisMerchant = (newMerchant: Omit<QrisMerchantAccount, 'id'>) => {
+    const item: QrisMerchantAccount = {
+      ...newMerchant,
+      id: 'merchant_' + Date.now(),
+    };
+    setQrisMerchants((prev) => {
+      let updated = [...prev];
+      if (item.isDefault) {
+        updated = updated.map((m) => ({ ...m, isDefault: false }));
+      }
+      return [item, ...updated];
+    });
+    handleSelectQrisMerchant(item);
+  };
+
+  const handleUpdateQrisMerchant = (updatedMerchant: QrisMerchantAccount) => {
+    setQrisMerchants((prev) =>
+      prev.map((m) => {
+        if (m.id === updatedMerchant.id) return updatedMerchant;
+        if (updatedMerchant.isDefault) return { ...m, isDefault: false };
+        return m;
+      })
+    );
+
+    if (activeQrisMerchantId === updatedMerchant.id) {
+      handleSelectQrisMerchant(updatedMerchant);
+    }
+  };
+
+  const handleDeleteQrisMerchant = (id: string) => {
+    if (qrisMerchants.length <= 1) {
+      addToast('Minimal harus ada 1 akun QRIS tersimpan.', 'warning');
+      return;
+    }
+    setQrisMerchants((prev) => {
+      const filtered = prev.filter((m) => m.id !== id);
+      if (activeQrisMerchantId === id && filtered.length > 0) {
+        handleSelectQrisMerchant(filtered[0]);
+      }
+      return filtered;
+    });
+    addToast('Akun QRIS berhasil dihapus.', 'info');
+  };
+
+  // Print single merchant standee barcode
+  const handlePrintMerchantStandee = async (merchant: QrisMerchantAccount) => {
+    if (settings.soundEnabled) playChimeSound();
+    const builder = buildQrisStandeeReceipt(merchant, settings);
+
+    if (bleConnected && globalBleState.characteristic) {
+      try {
+        await printViaBle(builder.getBytes());
+        addToast(`Mencetak barcode QRIS "${merchant.merchantName}" via Bluetooth BLE...`, 'success');
+        return;
+      } catch (e) {
+        console.warn('BLE print standee failed, fallback to RawBT', e);
+      }
+    }
+
+    printViaRawBt(builder.getBase64());
+    addToast(`Mencetak barcode QRIS "${merchant.merchantName}" ke printer thermal...`, 'info');
+  };
+
+  // Batch print all saved merchant standees
+  const handlePrintAllStandees = async () => {
+    if (settings.soundEnabled) playChimeSound();
+    const builder = buildAllQrisStandeesReceipt(qrisMerchants, settings);
+
+    if (bleConnected && globalBleState.characteristic) {
+      try {
+        await printViaBle(builder.getBytes());
+        addToast(`Mencetak batch ${qrisMerchants.length} barcode QRIS via Bluetooth BLE...`, 'success');
+        return;
+      } catch (e) {
+        console.warn('BLE print all standees failed, fallback to RawBT', e);
+      }
+    }
+
+    printViaRawBt(builder.getBase64());
+    addToast(`Mencetak batch ${qrisMerchants.length} barcode QRIS ke printer thermal...`, 'info');
   };
 
   // Connect BLE Driver
@@ -256,17 +586,34 @@ export default function App() {
 
   // Handle OCR scan complete: populate corresponding form and switch tab
   const handleScanComplete = (extracted: any, targetCategory?: TabType) => {
-    const cat: TabType = targetCategory || extracted.category || 'token';
+    const rawCat = (targetCategory || extracted.category || '').toLowerCase();
+    let cat: TabType = 'token';
+    if (rawCat.includes('pln') || rawCat.includes('token') || rawCat.includes('listrik') || rawCat.includes('stroom')) {
+      cat = 'token';
+    } else if (rawCat.includes('transfer') || rawCat.includes('bank') || rawCat.includes('kirim') || rawCat.includes('dana') || rawCat.includes('ovo') || rawCat.includes('gopay') || rawCat.includes('shopee')) {
+      cat = 'transfer';
+    } else if (rawCat.includes('qris') || rawCat.includes('merchant') || rawCat.includes('nmid')) {
+      cat = 'qris';
+    } else if (rawCat.includes('toko') || rawCat.includes('retail') || rawCat.includes('kasir') || rawCat.includes('belanja')) {
+      cat = 'toko';
+    } else if (targetCategory) {
+      cat = targetCategory;
+    }
+
     setActiveTab(cat);
+
+    const safeWaktu = (extracted.waktu && extracted.waktu !== 'null' && extracted.waktu !== 'None' && String(extracted.waktu).trim() !== '')
+      ? String(extracted.waktu)
+      : getCurrentIndonesianDateTime();
 
     if (cat === 'token') {
       setPlnData((prev) => {
-        const nom = extracted.nominal || prev.nominal;
-        const admPln = extracted.adminBank !== undefined ? extracted.adminBank : prev.adminPln;
-        const admKtr = extracted.adminKonter !== undefined ? extracted.adminKonter : prev.adminKonter;
+        const nom = Number(extracted.nominal) || prev.nominal;
+        const admPln = extracted.adminBank !== undefined ? Number(extracted.adminBank) : prev.adminPln;
+        const admKtr = extracted.adminKonter !== undefined ? Number(extracted.adminKonter) : prev.adminKonter;
         return {
           ...prev,
-          waktu: extracted.waktu || getCurrentIndonesianDateTime(),
+          waktu: safeWaktu,
           sn: extracted.refNo || prev.sn,
           idpel: extracted.idpel || prev.idpel,
           nama: extracted.namaPelanggan || prev.nama,
@@ -276,17 +623,18 @@ export default function App() {
           nominal: nom,
           adminPln: admPln,
           adminKonter: admKtr,
-          total: extracted.total || nom + admPln + admKtr,
+          total: Number(extracted.total) || (nom + admPln + admKtr),
         };
       });
+      addToast('Bukti Token PLN berhasil dipindai & dimasukkan ke form!', 'success');
     } else if (cat === 'transfer') {
       setTransferData((prev) => {
-        const nom = extracted.nominal || prev.nominal;
-        const admBank = extracted.adminBank !== undefined ? extracted.adminBank : prev.adminBank;
-        const admKtr = extracted.adminKonter !== undefined ? extracted.adminKonter : prev.adminKonter;
+        const nom = Number(extracted.nominal) || prev.nominal;
+        const admBank = extracted.adminBank !== undefined ? Number(extracted.adminBank) : prev.adminBank;
+        const admKtr = extracted.adminKonter !== undefined ? Number(extracted.adminKonter) : prev.adminKonter;
         return {
           ...prev,
-          waktu: extracted.waktu || getCurrentIndonesianDateTime(),
+          waktu: safeWaktu,
           refNo: extracted.refNo || prev.refNo,
           bankPengirim: extracted.bankPengirim || prev.bankPengirim,
           bankTujuan: extracted.bankTujuan || prev.bankTujuan,
@@ -295,42 +643,57 @@ export default function App() {
           nominal: nom,
           adminBank: admBank,
           adminKonter: admKtr,
-          total: extracted.total || nom + admBank + admKtr,
+          total: Number(extracted.total) || (nom + admBank + admKtr),
           status: extracted.status || 'BERHASIL',
           catatan: extracted.catatan || prev.catatan,
         };
       });
+      addToast('Bukti Transfer Bank/E-Wallet berhasil dipindai & dimasukkan ke form!', 'success');
     } else if (cat === 'qris') {
-      setQrisData((prev) => ({
-        ...prev,
-        waktu: extracted.waktu || getCurrentIndonesianDateTime(),
-        refNo: extracted.refNo || prev.refNo,
-        merchantName: extracted.merchantName || prev.merchantName,
-        nmid: extracted.nmid || prev.nmid,
-        acquirer: extracted.acquirer || prev.acquirer,
-        customerName: extracted.customerName || prev.customerName,
-        nominal: extracted.nominal || prev.nominal,
-        fee: extracted.adminBank || prev.fee,
-        total: extracted.total || prev.total,
-      }));
+      setQrisData((prev) => {
+        const nom = Number(extracted.nominal) || prev.nominal;
+        const fee = extracted.adminBank !== undefined ? Number(extracted.adminBank) : prev.fee;
+        const total = Number(extracted.total) || (nom + fee);
+        const mName = extracted.merchantName || prev.merchantName;
+        const mNmid = extracted.nmid || prev.nmid;
+        const isDynamic = prev.qrisType === 'dinamis';
+        const newPayload = generateStandardQris(mName, mNmid, 'JAKARTA', isDynamic, isDynamic ? total : 0);
+
+        return {
+          ...prev,
+          waktu: safeWaktu,
+          refNo: extracted.refNo || prev.refNo,
+          merchantName: mName,
+          nmid: mNmid,
+          acquirer: extracted.acquirer || prev.acquirer,
+          customerName: extracted.customerName || prev.customerName,
+          nominal: nom,
+          fee: fee,
+          total: total,
+          qrisPayload: newPayload,
+        };
+      });
+      addToast('Bukti QRIS berhasil dipindai & dimasukkan ke form!', 'success');
     } else if (cat === 'toko') {
       if (extracted.items && Array.isArray(extracted.items) && extracted.items.length > 0) {
         const formattedItems = extracted.items.map((it: any, idx: number) => ({
           id: 'item_' + Date.now() + idx,
           name: it.name || 'Produk',
-          qty: it.qty || 1,
-          price: it.price || 0,
-          subtotal: (it.qty || 1) * (it.price || 0),
+          qty: Number(it.qty) || 1,
+          price: Number(it.price) || 0,
+          subtotal: (Number(it.qty) || 1) * (Number(it.price) || 0),
         }));
-        const total = extracted.total || formattedItems.reduce((a: number, c: any) => a + c.subtotal, 0);
+        const total = Number(extracted.total) || formattedItems.reduce((a: number, c: any) => a + c.subtotal, 0);
         setTokoData((prev) => ({
           ...prev,
+          waktu: safeWaktu,
           items: formattedItems,
           total,
           tunai: total,
           kembali: 0,
         }));
       }
+      addToast('Bukti Belanja Toko berhasil dipindai & dimasukkan ke form!', 'success');
     }
 
     if (settings.soundEnabled) playChimeSound();
@@ -414,15 +777,25 @@ export default function App() {
       <Header
         settings={settings}
         onUpdateSettings={handleUpdateSettings}
-        onOpenSettingsModal={() => setShowSettingsModal(true)}
+        onOpenSettingsModal={() => {
+          setSettingsModalInitialTab('profil');
+          setShowSettingsModal(true);
+        }}
         onOpenHistoryModal={() => setShowHistoryModal(true)}
+        onOpenOnlineModal={() => setShowOnlineModal(true)}
+        onOpenShareGuideModal={() => setShowShareGuideModal(true)}
         historyCount={history.length}
         bleConnected={bleConnected}
         bleDeviceName={bleDeviceName}
+        isOnline={isOnline}
+        serverStatus={serverStatus}
       />
 
       {/* Main Container */}
       <main className="w-full max-w-md mx-auto p-3 flex-1">
+        {/* PWA Install Banner for Android */}
+        <PWAInstallButton variant="banner" />
+
         {/* Universal Bluetooth Driver Bar */}
         <BluetoothBar
           bleConnected={bleConnected}
@@ -460,7 +833,12 @@ export default function App() {
         />
 
         {/* Screenshot / Text OCR Scan Bar */}
-        <ScreenshotScanBox onScanComplete={handleScanComplete} />
+        <ScreenshotScanBox
+          onScanComplete={handleScanComplete}
+          onOpenShareGuide={() => setShowShareGuideModal(true)}
+          externalFileToProcess={sharedFileToProcess}
+          onClearExternalFile={() => setSharedFileToProcess(null)}
+        />
 
         {/* 4 Feature Tabs */}
         <TabNavigation activeTab={activeTab} onTabChange={setActiveTab} />
@@ -468,7 +846,24 @@ export default function App() {
         {/* Active Feature Form */}
         {activeTab === 'token' && <TokenPlnForm data={plnData} onChange={setPlnData} />}
         {activeTab === 'transfer' && <TransferForm data={transferData} onChange={setTransferData} />}
-        {activeTab === 'qris' && <QrisForm data={qrisData} onChange={setQrisData} />}
+        {activeTab === 'qris' && (
+          <QrisForm
+            data={qrisData}
+            onChange={setQrisData}
+            onOpenQrModal={() => setShowQrModal(true)}
+            onNotify={addToast}
+            masterQris={masterQris}
+            onSaveMasterQris={handleSaveMasterQris}
+            savedMerchants={qrisMerchants}
+            activeMerchantId={activeQrisMerchantId}
+            onSelectMerchant={handleSelectQrisMerchant}
+            onOpenSettingsModal={() => {
+              setSettingsModalInitialTab('qris');
+              setShowSettingsModal(true);
+            }}
+            onPrintMerchantStandee={handlePrintMerchantStandee}
+          />
+        )}
         {activeTab === 'toko' && (
           <TokoForm data={tokoData} onChange={setTokoData} storeName={settings.storeName} />
         )}
@@ -485,8 +880,23 @@ export default function App() {
           bleConnected={bleConnected}
           onConnectBlePrompt={handleConnectBle}
           onNotify={addToast}
+          onOpenQrModal={() => setShowQrModal(true)}
         />
       </main>
+
+      {/* QRIS Fullscreen Customer Display Modal */}
+      <QrisDisplayModal
+        isOpen={showQrModal}
+        onClose={() => setShowQrModal(false)}
+        data={qrisData}
+        settings={settings}
+        onPrintReceipt={() => {
+          const builder = buildEscPosReceipt('qris', qrisData, settings);
+          printViaRawBt(builder.getBase64());
+          handleRecordHistory();
+          addToast('Membuka driver RawBT...', 'info');
+        }}
+      />
 
       {/* Modals & Drawers */}
       <BleNoticeModal
@@ -521,8 +931,47 @@ export default function App() {
         isOpen={showSettingsModal}
         onClose={() => setShowSettingsModal(false)}
         settings={settings}
-        onSave={setSettings}
-        onResetDefaults={() => setSettings(DEFAULT_SETTINGS)}
+        onSave={(newSettings) => {
+          handleUpdateSettings(newSettings);
+          if (newSettings.masterQris) {
+            handleSaveMasterQris(newSettings.masterQris);
+          }
+        }}
+        onResetDefaults={() => {
+          setSettings(DEFAULT_SETTINGS);
+          handleSaveMasterQris(DEFAULT_MASTER_QRIS);
+          setQrisMerchants(DEFAULT_QRIS_MERCHANTS);
+          handleSelectQrisMerchant(DEFAULT_QRIS_MERCHANTS[0]);
+        }}
+        merchants={qrisMerchants}
+        activeMerchantId={activeQrisMerchantId}
+        onSelectMerchant={handleSelectQrisMerchant}
+        onAddMerchant={handleAddQrisMerchant}
+        onUpdateMerchant={handleUpdateQrisMerchant}
+        onDeleteMerchant={handleDeleteQrisMerchant}
+        onPrintMerchantStandee={handlePrintMerchantStandee}
+        onPrintAllStandees={handlePrintAllStandees}
+        initialTab={settingsModalInitialTab}
+        onNotify={addToast}
+      />
+
+      <OnlineShareModal
+        isOpen={showOnlineModal}
+        onClose={() => setShowOnlineModal(false)}
+        isOnline={isOnline}
+        serverStatus={serverStatus}
+        latency={latency}
+        onRefreshHealth={checkNow}
+      />
+
+      <ShareGuideModal
+        isOpen={showShareGuideModal}
+        onClose={() => setShowShareGuideModal(false)}
+        onSelectFile={(file) => setSharedFileToProcess(file)}
+        onOpenInstallModal={() => {
+          addToast('Silakan ketuk tombol Pasang App di bagian atas untuk menginstal di HP Android', 'info');
+        }}
+        isInstalled={typeof window !== 'undefined' && window.matchMedia('(display-mode: standalone)').matches}
       />
 
       <HistoryDrawer

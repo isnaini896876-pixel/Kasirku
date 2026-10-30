@@ -1,4 +1,5 @@
-import React, { useRef, useState } from 'react';
+import React, { useRef, useState, useEffect } from 'react';
+import QRCode from 'qrcode';
 import {
   TabType,
   PlnTokenData,
@@ -13,6 +14,7 @@ import {
   buildEscPosReceipt,
   buildWhatsAppTextReceipt,
   printViaBle,
+  shareToPrinterApp,
   globalBleState,
 } from '../utils/printer';
 import { announceTransaction, playChimeSound } from '../utils/sound';
@@ -27,6 +29,8 @@ import {
   ZoomIn,
   ZoomOut,
   Bluetooth,
+  Eye,
+  QrCode,
 } from 'lucide-react';
 
 interface ReceiptPreviewProps {
@@ -40,6 +44,7 @@ interface ReceiptPreviewProps {
   bleConnected: boolean;
   onConnectBlePrompt: () => void;
   onNotify?: (message: string, type?: 'success' | 'error' | 'warning' | 'info') => void;
+  onOpenQrModal?: () => void;
 }
 
 export const ReceiptPreview: React.FC<ReceiptPreviewProps> = ({
@@ -53,11 +58,28 @@ export const ReceiptPreview: React.FC<ReceiptPreviewProps> = ({
   bleConnected,
   onConnectBlePrompt,
   onNotify,
+  onOpenQrModal,
 }) => {
   const receiptRef = useRef<HTMLDivElement>(null);
   const [copiedNotice, setCopiedNotice] = useState(false);
   const [isPrintingBle, setIsPrintingBle] = useState(false);
   const [zoomLevel, setZoomLevel] = useState<'normal' | 'large'>('normal');
+  const [receiptQrCodeUrl, setReceiptQrCodeUrl] = useState<string>('');
+
+  useEffect(() => {
+    if (!qrisData.qrisPayload) {
+      setReceiptQrCodeUrl('');
+      return;
+    }
+    QRCode.toDataURL(qrisData.qrisPayload, {
+      width: 260,
+      margin: 1,
+      errorCorrectionLevel: 'M',
+      color: { dark: '#000000', light: '#ffffff' },
+    })
+      .then((url) => setReceiptQrCodeUrl(url))
+      .catch((err) => console.warn('QR receipt render error:', err));
+  }, [qrisData.qrisPayload]);
 
   const getData = () => {
     switch (activeTab) {
@@ -203,7 +225,19 @@ export const ReceiptPreview: React.FC<ReceiptPreviewProps> = ({
     }
   };
 
-  // 6. Voice Announcement
+  // 6. Share receipt text to mobile printer app
+  const handleShareToPrinterApp = async () => {
+    const text = buildWhatsAppTextReceipt(activeTab, currentData, settings);
+    const shared = await shareToPrinterApp(text);
+    if (!shared) {
+      handlePrintRawBt();
+    } else {
+      onRecordHistory();
+      if (onNotify) onNotify('Membuka menu bagikan ke aplikasi printer...', 'info');
+    }
+  };
+
+  // 7. Voice Announcement
   const handleAnnounceVoice = () => {
     announceTransaction(getTotalAmount(), activeTab, settings.storeName);
   };
@@ -239,6 +273,17 @@ export const ReceiptPreview: React.FC<ReceiptPreviewProps> = ({
             <Volume2 className="w-3.5 h-3.5" />
             <span className="hidden sm:inline">Suara</span>
           </button>
+
+          {activeTab === 'qris' && onOpenQrModal && (
+            <button
+              onClick={onOpenQrModal}
+              className="p-1 rounded bg-rose-600 hover:bg-rose-500 text-white text-xs flex items-center gap-1 font-bold px-2 transition active:scale-95"
+              title="Tampilkan Kode QR Layar Penuh untuk Di-scan Pelanggan"
+            >
+              <Eye className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Lihat QR</span>
+            </button>
+          )}
         </div>
       </div>
 
@@ -377,20 +422,33 @@ export const ReceiptPreview: React.FC<ReceiptPreviewProps> = ({
                   <span className="font-mono">{transferData.refNo || '-'}</span>
                 </div>
                 <div className="border-t border-dashed border-black my-1" />
-                <div className="flex justify-between">
-                  <span>SUMBER DANA</span>
-                  <span className="font-bold">{transferData.bankPengirim || '-'}</span>
-                </div>
-                {transferData.rekeningPengirim && (
-                  <div className="flex justify-between">
-                    <span>NO. REK PENGIRIM</span>
-                    <span className="font-mono">
-                      {transferData.sensorRekening
-                        ? maskAccount(transferData.rekeningPengirim)
-                        : transferData.rekeningPengirim}
-                    </span>
-                  </div>
+
+                {/* Sumber Dana (Bisa diatur Hidup / Mati) */}
+                {transferData.tampilkanRekeningPengirim !== false && (
+                  <>
+                    <div className="flex justify-between">
+                      <span>{transferData.kategoriPengirim ? `SUMBER (${transferData.kategoriPengirim})` : 'SUMBER DANA'}</span>
+                      <span className="font-bold">{transferData.bankPengirim || '-'}</span>
+                    </div>
+                    {transferData.rekeningPengirim && (
+                      <div className="flex justify-between">
+                        <span>NO. REK PENGIRIM</span>
+                        <span className="font-mono">
+                          {transferData.sensorRekening
+                            ? maskAccount(transferData.rekeningPengirim)
+                            : transferData.rekeningPengirim}
+                        </span>
+                      </div>
+                    )}
+                    {transferData.namaPengirim && (
+                      <div className="flex justify-between text-[10px]">
+                        <span>PENGIRIM</span>
+                        <span className="uppercase">{transferData.namaPengirim}</span>
+                      </div>
+                    )}
+                  </>
                 )}
+
                 <div className="flex justify-between">
                   <span>TUJUAN</span>
                   <span className="font-bold">{transferData.bankTujuan || '-'}</span>
@@ -403,7 +461,9 @@ export const ReceiptPreview: React.FC<ReceiptPreviewProps> = ({
                   <span>PENERIMA</span>
                   <span className="uppercase">{transferData.namaPenerima || '-'}</span>
                 </div>
-                {transferData.catatan && (
+
+                {/* Tulisan Berita Opsional (Bisa diatur Hidup / Mati) */}
+                {transferData.tampilkanCatatan !== false && transferData.catatan && (
                   <div className="flex justify-between text-[10px]">
                     <span>BERITA</span>
                     <span>{transferData.catatan}</span>
@@ -443,9 +503,12 @@ export const ReceiptPreview: React.FC<ReceiptPreviewProps> = ({
               <div className="text-center font-bold tracking-tight text-[11px]">
                 BUKTI PEMBAYARAN QRIS
               </div>
-              <div className="text-center">
-                <span className="inline-block bg-black text-white font-black px-2 py-0.5 text-[10px] rounded">
+              <div className="text-center flex justify-center gap-1">
+                <span className="inline-block bg-black text-white font-black px-2 py-0.5 text-[9px] rounded uppercase">
                   {qrisData.status || 'SUKSES DITERIMA'}
+                </span>
+                <span className="inline-block bg-rose-700 text-white font-black px-2 py-0.5 text-[9px] rounded uppercase">
+                  {qrisData.qrisType === 'dinamis' ? 'QRIS DINAMIS' : 'QRIS STATIS'}
                 </span>
               </div>
 
@@ -480,23 +543,59 @@ export const ReceiptPreview: React.FC<ReceiptPreviewProps> = ({
                 )}
               </div>
 
+              {/* Financial Breakdown */}
               <div className="border-t border-dashed border-black pt-1 space-y-0.5 text-[11px]">
-                <div className="flex justify-between">
-                  <span>NOMINAL</span>
-                  <span>{formatRupiah(qrisData.nominal)}</span>
-                </div>
-                {qrisData.fee > 0 && (
-                  <div className="flex justify-between">
-                    <span>BIAYA ADMIN</span>
-                    <span>{formatRupiah(qrisData.fee)}</span>
-                  </div>
+                {qrisData.qrisType === 'dinamis' ? (
+                  <>
+                    <div className="flex justify-between">
+                      <span>NOMINAL BELANJA</span>
+                      <span>{formatRupiah(qrisData.nominal)}</span>
+                    </div>
+                    {qrisData.fee > 0 && (
+                      <div className="flex justify-between">
+                        <span>BIAYA LAYANAN</span>
+                        <span>{formatRupiah(qrisData.fee)}</span>
+                      </div>
+                    )}
+                    <div className="border-t border-black my-1" />
+                    <div className="flex justify-between font-black text-xs">
+                      <span>TOTAL BAYAR (PAS)</span>
+                      <span>{formatRupiah(qrisData.total)}</span>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="flex justify-between">
+                      <span>NOMINAL</span>
+                      <span>{qrisData.nominal > 0 ? formatRupiah(qrisData.nominal) : 'BEBAS / MANUAL'}</span>
+                    </div>
+                    <div className="border-t border-black my-1" />
+                    <div className="flex justify-between font-black text-xs">
+                      <span>STATUS PEMBAYARAN</span>
+                      <span>{qrisData.total > 0 ? formatRupiah(qrisData.total) : 'SESUAI TRANSFER'}</span>
+                    </div>
+                  </>
                 )}
-                <div className="border-t border-black my-1" />
-                <div className="flex justify-between font-black text-xs">
-                  <span>TOTAL PEMBAYARAN</span>
-                  <span>{formatRupiah(qrisData.total)}</span>
-                </div>
               </div>
+
+              {/* Scannable Real QRIS Code in Receipt Preview */}
+              {qrisData.printQrOnReceipt && receiptQrCodeUrl && (
+                <div className="my-2 p-2 border-2 border-dashed border-black rounded flex flex-col items-center justify-center bg-white text-center">
+                  <span className="text-[10px] font-black tracking-tight mb-1">
+                    {qrisData.qrisType === 'dinamis' ? '⚡ SCAN UNTUK BAYAR (NOMINAL PAS)' : '🏛️ SCAN QRIS (MASUKKAN NOMINAL)'}
+                  </span>
+                  <img
+                    src={receiptQrCodeUrl}
+                    alt="QRIS Barcode"
+                    className="w-32 h-32 object-contain border border-black/20 p-1"
+                  />
+                  <span className="text-[9px] font-mono font-bold mt-1">
+                    {qrisData.qrisType === 'dinamis'
+                      ? `Nominal Otomatis: ${formatRupiah(qrisData.total || qrisData.nominal)}`
+                      : 'Bebas Masukkan Nominal di M-Banking / E-Wallet'}
+                  </span>
+                </div>
+              )}
             </div>
           )}
 
@@ -655,22 +754,31 @@ export const ReceiptPreview: React.FC<ReceiptPreviewProps> = ({
           </button>
         </div>
 
-        {/* 3RD ROW: WHATSAPP TEXT & DOWNLOAD IMAGE */}
-        <div className="grid grid-cols-2 gap-2">
+        {/* 3RD ROW: SHARE KE PRINTER APP / WHATSAPP & DOWNLOAD */}
+        <div className="grid grid-cols-3 gap-1.5">
+          <button
+            onClick={handleShareToPrinterApp}
+            className="flex items-center justify-center gap-1 bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300 py-2 px-1.5 rounded-lg font-bold text-[11px] transition active:scale-95 shadow-2xs"
+            title="Bagikan teks struk ke driver Bluetooth atau aplikasi printer HP lain"
+          >
+            <Share2 className="w-3.5 h-3.5 text-amber-700" />
+            <span className="truncate">Share Printer</span>
+          </button>
+
           <button
             onClick={handleCopyWhatsApp}
-            className="flex items-center justify-center gap-1.5 bg-teal-50 hover:bg-teal-100 text-teal-800 border border-teal-300 py-2.5 px-3 rounded-lg font-bold text-xs transition active:scale-95"
+            className="flex items-center justify-center gap-1 bg-teal-50 hover:bg-teal-100 text-teal-800 border border-teal-300 py-2 px-1.5 rounded-lg font-bold text-[11px] transition active:scale-95 shadow-2xs"
           >
-            {copiedNotice ? <Check className="w-4 h-4 text-emerald-600" /> : <Copy className="w-4 h-4" />}
-            <span>{copiedNotice ? 'Tersalin!' : 'Salin Teks WhatsApp'}</span>
+            {copiedNotice ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+            <span className="truncate">{copiedNotice ? 'Tersalin!' : 'Salin WA'}</span>
           </button>
 
           <button
             onClick={handleDownloadImage}
-            className="flex items-center justify-center gap-1.5 bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-300 py-2.5 px-3 rounded-lg font-bold text-xs transition active:scale-95"
+            className="flex items-center justify-center gap-1 bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-300 py-2 px-1.5 rounded-lg font-bold text-[11px] transition active:scale-95 shadow-2xs"
           >
-            <Download className="w-4 h-4 text-slate-600" />
-            <span>Simpan Gambar PNG</span>
+            <Download className="w-3.5 h-3.5 text-slate-600" />
+            <span className="truncate">Gambar PNG</span>
           </button>
         </div>
       </div>

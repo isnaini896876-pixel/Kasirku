@@ -2,7 +2,7 @@ import express, { Request, Response } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
 
 dotenv.config();
 
@@ -33,6 +33,11 @@ app.get('/api/health', (_req: Request, res: Response) => {
   });
 });
 
+// Fallback endpoint for Web Share Target if request reaches server
+app.post('/share-target', (_req: Request, res: Response) => {
+  res.redirect('/?shared=receipt');
+});
+
 // API OCR and Intelligent Receipt Parsing
 app.post('/api/scan-receipt', async (req: Request, res: Response) => {
   try {
@@ -45,7 +50,7 @@ app.post('/api/scan-receipt', async (req: Request, res: Response) => {
 
     if (!process.env.GEMINI_API_KEY) {
       res.status(503).json({
-        error: 'GEMINI_API_KEY belum dikonfigurasi. Menggunakan parser cerdas lokal.',
+        error: 'GEMINI_API_KEY belum dikonfigurasi.',
         useFallback: true,
       });
       return;
@@ -76,84 +81,121 @@ Panduan angka & nominal:
 - Semua nominal uang harus berupa integer murni tanpa titik/koma (contoh 50000).`;
 
     const promptText = `Analisis dan ekstrak data dari bukti transaksi berikut menjadi data JSON terstruktur untuk kasir:
-${text ? `Teks transaksi: "${text}"` : 'Tolong baca informasi dari gambar screenshot struk transaksi terlampir.'}`;
+${text ? `Teks transaksi: "${text}"` : 'Tolong baca semua informasi penting dari gambar screenshot struk transaksi ini.'}`;
+
+    let cleanBase64 = '';
+    let detectedMime = mimeType || 'image/jpeg';
+    if (imageBase64) {
+      const commaIdx = imageBase64.indexOf(',');
+      if (commaIdx !== -1) {
+        const header = imageBase64.slice(0, commaIdx);
+        cleanBase64 = imageBase64.slice(commaIdx + 1).trim();
+        const mimeMatch = header.match(/^data:([^;]+);base64/i);
+        if (mimeMatch) {
+          detectedMime = mimeMatch[1];
+        }
+      } else {
+        cleanBase64 = imageBase64.trim();
+      }
+    }
 
     const parts: any[] = [];
-    if (imageBase64) {
-      const cleanBase64 = imageBase64.replace(/^data:image\/[a-zA-Z+]+;base64,/, '');
+    if (cleanBase64) {
       parts.push({
         inlineData: {
-          mimeType: mimeType || 'image/jpeg',
+          mimeType: detectedMime,
           data: cleanBase64,
         },
       });
     }
     parts.push({ text: promptText });
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: { parts },
-      config: {
-        systemInstruction: systemPrompt,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            category: {
-              type: Type.STRING,
-              description: 'Kategori transaksi: "token", "transfer", "qris", atau "toko"',
-            },
-            waktu: { type: Type.STRING, description: 'Tanggal dan waktu transaksi' },
-            refNo: { type: Type.STRING, description: 'Nomor referensi atau serial number (SN)' },
-            // Token PLN
-            idpel: { type: Type.STRING, description: 'Nomor IDPEL atau No Meter PLN' },
-            namaPelanggan: { type: Type.STRING, description: 'Nama pelanggan' },
-            tarifDaya: { type: Type.STRING, description: 'Tarif dan Daya (misal R1M/900 VA)' },
-            kwh: { type: Type.STRING, description: 'Jumlah kWh listrik (misal 33.1 kWh)' },
-            tokenNumber: { type: Type.STRING, description: 'Kode 20 digit token PLN dipisah tanda hubung 4-4-4-4-4' },
-            // Transfer
-            bankPengirim: { type: Type.STRING, description: 'Bank atau E-Wallet asal pengirim' },
-            bankTujuan: { type: Type.STRING, description: 'Bank atau E-Wallet penerima' },
-            rekeningTujuan: { type: Type.STRING, description: 'Nomor rekening atau nomor HP tujuan' },
-            namaPenerima: { type: Type.STRING, description: 'Nama pemilik rekening penerima' },
-            catatan: { type: Type.STRING, description: 'Berita atau catatan transfer' },
-            status: { type: Type.STRING, description: 'Status transaksi (BERHASIL, LUNAS, SUKSES)' },
-            // QRIS
-            merchantName: { type: Type.STRING, description: 'Nama Merchant QRIS' },
-            nmid: { type: Type.STRING, description: 'NMID QRIS jika ada' },
-            acquirer: { type: Type.STRING, description: 'Acquirer QRIS' },
-            // Toko / Items
-            items: {
-              type: Type.ARRAY,
-              description: 'Daftar item belanja untuk kategori toko',
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  name: { type: Type.STRING },
-                  qty: { type: Type.NUMBER },
-                  price: { type: Type.NUMBER },
-                },
-                required: ['name', 'qty', 'price'],
-              },
-            },
-            // Finansial
-            nominal: { type: Type.NUMBER, description: 'Nominal pokok transaksi (rupiah murni)' },
-            adminBank: { type: Type.NUMBER, description: 'Biaya admin bank atau admin PLN' },
-            adminKonter: { type: Type.NUMBER, description: 'Biaya jasa konter atau toko' },
-            total: { type: Type.NUMBER, description: 'Total bayar keseluruhan' },
-          },
-          required: ['category', 'nominal', 'total'],
-        },
-      },
-    });
+    // Try models in order: gemini-3.1-flash-lite (fastest, high throughput), gemini-flash-latest, gemini-3.8-flash
+    const candidateModels = ['gemini-3.1-flash-lite', 'gemini-flash-latest', 'gemini-3.8-flash'];
+    let lastError: any = null;
+    let parsedData: any = null;
 
-    const outputText = response.text;
-    if (!outputText) {
-      throw new Error('Tidak ada respon teks dari model.');
+    for (const model of candidateModels) {
+      try {
+        console.log(`[OCR] Mencoba analisis dengan model: ${model}`);
+        const response = await ai.models.generateContent({
+          model,
+          contents: parts,
+          config: {
+            systemInstruction: systemPrompt,
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                category: {
+                  type: Type.STRING,
+                  description: 'Kategori transaksi: "token", "transfer", "qris", atau "toko"',
+                },
+                waktu: { type: Type.STRING, description: 'Tanggal dan waktu transaksi (format DD/MM/YYYY HH:mm:ss)' },
+                refNo: { type: Type.STRING, description: 'Nomor referensi atau serial number (SN)' },
+                // Token PLN
+                idpel: { type: Type.STRING, description: 'Nomor IDPEL atau No Meter PLN' },
+                namaPelanggan: { type: Type.STRING, description: 'Nama pelanggan' },
+                tarifDaya: { type: Type.STRING, description: 'Tarif dan Daya (misal R1M/900 VA)' },
+                kwh: { type: Type.STRING, description: 'Jumlah kWh listrik (misal 33.1 kWh)' },
+                tokenNumber: { type: Type.STRING, description: 'Kode 20 digit token PLN dipisah tanda hubung 4-4-4-4-4' },
+                // Transfer
+                bankPengirim: { type: Type.STRING, description: 'Bank atau E-Wallet asal pengirim' },
+                bankTujuan: { type: Type.STRING, description: 'Bank atau E-Wallet penerima' },
+                rekeningTujuan: { type: Type.STRING, description: 'Nomor rekening atau nomor HP tujuan' },
+                namaPenerima: { type: Type.STRING, description: 'Nama pemilik rekening penerima' },
+                catatan: { type: Type.STRING, description: 'Berita atau catatan transfer' },
+                status: { type: Type.STRING, description: 'Status transaksi (BERHASIL, LUNAS, SUKSES)' },
+                // QRIS
+                merchantName: { type: Type.STRING, description: 'Nama Merchant QRIS' },
+                nmid: { type: Type.STRING, description: 'NMID QRIS jika ada' },
+                acquirer: { type: Type.STRING, description: 'Acquirer QRIS' },
+                // Toko / Items
+                items: {
+                  type: Type.ARRAY,
+                  description: 'Daftar item belanja untuk kategori toko',
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      name: { type: Type.STRING },
+                      qty: { type: Type.NUMBER },
+                      price: { type: Type.NUMBER },
+                    },
+                    required: ['name', 'qty', 'price'],
+                  },
+                },
+                // Finansial
+                nominal: { type: Type.NUMBER, description: 'Nominal pokok transaksi (rupiah murni)' },
+                adminBank: { type: Type.NUMBER, description: 'Biaya admin bank atau admin PLN' },
+                adminKonter: { type: Type.NUMBER, description: 'Biaya jasa konter atau toko' },
+                total: { type: Type.NUMBER, description: 'Total bayar keseluruhan' },
+              },
+              required: ['category', 'nominal', 'total'],
+            },
+          },
+        });
+
+        let outputText = response.text || '';
+        outputText = outputText.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
+
+        if (outputText) {
+          parsedData = JSON.parse(outputText);
+          console.log(`[OCR] Sukses dengan ${model}, category:`, parsedData.category);
+          break;
+        }
+      } catch (err: any) {
+        lastError = err;
+        console.warn(`[OCR] Gagal dengan ${model}:`, err?.message || err);
+        // Continue to next candidate model
+      }
     }
 
-    const parsedData = JSON.parse(outputText);
-    res.json({ success: true, data: parsedData });
+    if (parsedData) {
+      res.json({ success: true, data: parsedData });
+      return;
+    }
+
+    throw lastError || new Error('Semua model AI sedang sibuk. Silakan coba kembali.');
   } catch (error: any) {
     console.error('Error scanning receipt with Gemini:', error);
     res.status(500).json({
@@ -162,6 +204,24 @@ ${text ? `Teks transaksi: "${text}"` : 'Tolong baca informasi dari gambar screen
     });
   }
 });
+
+// Explicit route for Service Worker with correct MIME type and scope headers
+app.get('/sw.js', (_req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+  res.setHeader('Service-Worker-Allowed', '/');
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.sendFile(path.resolve(__dirname, 'public', 'sw.js'));
+});
+
+// Explicit route for Web App Manifest
+app.get(['/manifest.json', '/manifest.webmanifest'], (_req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'application/manifest+json; charset=utf-8');
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.sendFile(path.resolve(__dirname, 'public', 'manifest.json'));
+});
+
+// Serve static assets from public folder
+app.use(express.static(path.resolve(__dirname, 'public')));
 
 // Setup Vite in Dev or Static files in Prod
 async function startServer() {

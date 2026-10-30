@@ -1,4 +1,4 @@
-import { StoreSettings, TabType, PlnTokenData, TransferData, QrisData, TokoData } from '../types';
+import { StoreSettings, TabType, PlnTokenData, TransferData, QrisData, TokoData, QrisMerchantAccount } from '../types';
 import { formatRupiah, maskAccount } from './formatters';
 
 // Common ESC/POS BLE Service & Characteristic UUIDs
@@ -251,6 +251,30 @@ export class EscPosBuilder {
     return this;
   }
 
+  qrCode(content: string, size: number = 6) {
+    if (!content) return this;
+    const encoder = new TextEncoder();
+    const dataBytes = encoder.encode(content);
+    const len = dataBytes.length + 3;
+    const pL = len % 256;
+    const pH = Math.floor(len / 256);
+
+    // 1. Model: GS ( k 04 00 31 41 32 00
+    this.buffer.push(0x1d, 0x28, 0x6b, 0x04, 0x00, 0x31, 0x41, 0x32, 0x00);
+    // 2. Size: GS ( k 03 00 31 43 size
+    this.buffer.push(0x1d, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x43, Math.min(Math.max(size, 1), 16));
+    // 3. Error correction level M (49): GS ( k 03 00 31 45 49
+    this.buffer.push(0x1d, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x45, 0x31);
+    // 4. Store data: GS ( k pL pH 31 50 30 d1...dk
+    this.buffer.push(0x1d, 0x28, 0x6b, pL, pH, 0x31, 0x50, 0x30);
+    for (let i = 0; i < dataBytes.length; i++) {
+      this.buffer.push(dataBytes[i]);
+    }
+    // 5. Print: GS ( k 03 00 31 51 30
+    this.buffer.push(0x1d, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x51, 0x30);
+    return this;
+  }
+
   feed(lines: number = 3) {
     for (let i = 0; i < lines; i++) {
       this.buffer.push(0x0a);
@@ -300,6 +324,23 @@ export function printViaRawBt(base64Data: string): void {
   setTimeout(() => {
     document.body.removeChild(a);
   }, 300);
+}
+
+// Share text directly to mobile Bluetooth printer app
+export async function shareToPrinterApp(plainText: string): Promise<boolean> {
+  if (typeof navigator !== 'undefined' && navigator.share) {
+    try {
+      await navigator.share({
+        title: 'Cetak Struk Thermal',
+        text: plainText,
+      });
+      return true;
+    } catch {
+      // User cancelled or unsupported
+      return false;
+    }
+  }
+  return false;
 }
 
 // Send ESC/POS commands directly over BLE in chunks of 512 bytes
@@ -379,16 +420,28 @@ export function buildEscPosReceipt(
     builder.twoColumn('WAKTU', tf.waktu || '-', cols);
     builder.twoColumn('NO. REFERENSI', tf.refNo || '-', cols);
     builder.divider(cols, '-');
-    builder.twoColumn('SUMBER DANA', tf.bankPengirim || '-', cols);
-    if (tf.rekeningPengirim) {
-      builder.twoColumn('NO. REKENING', tf.sensorRekening ? maskAccount(tf.rekeningPengirim) : tf.rekeningPengirim, cols);
+
+    // Sumber Dana (bisa diatur hidup/mati)
+    if (tf.tampilkanRekeningPengirim !== false) {
+      const labelSumber = tf.kategoriPengirim ? `SUMBER (${tf.kategoriPengirim})` : 'SUMBER DANA';
+      builder.twoColumn(labelSumber, tf.bankPengirim || '-', cols);
+      if (tf.rekeningPengirim) {
+        builder.twoColumn('NO. REKENING', tf.sensorRekening ? maskAccount(tf.rekeningPengirim) : tf.rekeningPengirim, cols);
+      }
+      if (tf.namaPengirim) {
+        builder.twoColumn('PENGIRIM', tf.namaPengirim.toUpperCase(), cols);
+      }
     }
+
     builder.twoColumn('TUJUAN', tf.bankTujuan || '-', cols);
     builder.twoColumn('NO. REK/HP', tf.rekeningTujuan || '-', cols);
     builder.twoColumn('PENERIMA', (tf.namaPenerima || '-').toUpperCase(), cols);
-    if (tf.catatan) {
+
+    // Tulisan Berita Opsional (bisa diatur hidup/mati)
+    if (tf.tampilkanCatatan !== false && tf.catatan) {
       builder.twoColumn('BERITA', tf.catatan, cols);
     }
+
     builder.divider(cols, '-');
     builder.twoColumn('NOMINAL TRF', formatRupiah(tf.nominal), cols);
     if (tf.statusAdminBank && tf.adminBank > 0) {
@@ -405,6 +458,7 @@ export function buildEscPosReceipt(
     const qris = data as QrisData;
     builder.alignCenter().bold(true).line('BUKTI PEMBAYARAN QRIS').bold(false).alignLeft();
     builder.twoColumn('STATUS', qris.status || 'SUKSES', cols);
+    builder.twoColumn('TIPE QRIS', qris.qrisType === 'dinamis' ? 'DINAMIS (PAS)' : 'STATIS', cols);
     builder.twoColumn('WAKTU', qris.waktu || '-', cols);
     builder.twoColumn('MERCHANT', qris.merchantName || settings.storeName, cols);
     if (qris.nmid) builder.twoColumn('NMID', qris.nmid, cols);
@@ -420,6 +474,15 @@ export function buildEscPosReceipt(
     builder.bold(true);
     builder.twoColumn('TOTAL BAYAR', formatRupiah(qris.total), cols);
     builder.bold(false);
+
+    if (qris.printQrOnReceipt && qris.qrisPayload) {
+      builder.feed(1);
+      builder.alignCenter();
+      builder.qrCode(qris.qrisPayload, 6);
+      builder.feed(1);
+      builder.bold(true).line(qris.qrisType === 'dinamis' ? '[ SCAN UNTUK BAYAR PAS ]' : '[ SCAN QRIS BEBAS ]').bold(false);
+      builder.alignLeft();
+    }
   } else if (type === 'toko') {
     const toko = data as TokoData;
     builder.alignCenter().bold(true).line('STRUK PENJUALAN TOKO').bold(false).alignLeft();
@@ -502,10 +565,15 @@ export function buildWhatsAppTextReceipt(
     lines.push(`Status: *${tf.status}*`);
     lines.push(`Waktu: ${tf.waktu}`);
     lines.push(`No. Ref: ${tf.refNo}`);
-    lines.push(`Dari: ${tf.bankPengirim} (${tf.sensorRekening ? maskAccount(tf.rekeningPengirim) : tf.rekeningPengirim})`);
+    if (tf.tampilkanRekeningPengirim !== false) {
+      const ketKategori = tf.kategoriPengirim ? ` (${tf.kategoriPengirim})` : '';
+      const rek = tf.sensorRekening ? maskAccount(tf.rekeningPengirim) : tf.rekeningPengirim;
+      lines.push(`Dari: ${tf.bankPengirim}${ketKategori}${rek ? ` - ${rek}` : ''}`);
+      if (tf.namaPengirim) lines.push(`Pengirim: ${tf.namaPengirim}`);
+    }
     lines.push(`Tujuan: ${tf.bankTujuan} - ${tf.rekeningTujuan}`);
     lines.push(`Penerima: *${tf.namaPenerima}*`);
-    if (tf.catatan) lines.push(`Berita: ${tf.catatan}`);
+    if (tf.tampilkanCatatan !== false && tf.catatan) lines.push(`Berita: ${tf.catatan}`);
     lines.push('--------------------------------');
     lines.push(`Nominal: ${formatRupiah(tf.nominal)}`);
     if (tf.statusAdminBank && tf.adminBank > 0) lines.push(`Biaya Admin: ${formatRupiah(tf.adminBank)}`);
@@ -514,8 +582,11 @@ export function buildWhatsAppTextReceipt(
   } else if (type === 'qris') {
     const qris = data as QrisData;
     lines.push('*BUKTI PEMBAYARAN QRIS*');
+    lines.push(`Status: *${qris.status || 'BERHASIL'}*`);
+    lines.push(`Tipe QRIS: *${qris.qrisType === 'dinamis' ? 'DINAMIS (Nominal Terkunci)' : 'STATIS (Nominal Bebas)'}*`);
     lines.push(`Waktu: ${qris.waktu}`);
     lines.push(`Merchant: ${qris.merchantName}`);
+    if (qris.nmid) lines.push(`NMID: ${qris.nmid}`);
     lines.push(`Acquirer: ${qris.acquirer}`);
     lines.push(`RRN/Ref: ${qris.refNo}`);
     if (qris.customerName) lines.push(`Pelanggan: ${qris.customerName}`);
@@ -543,3 +614,156 @@ export function buildWhatsAppTextReceipt(
   lines.push(settings.footerMessage || 'Terima kasih atas kepercayaan Anda!');
   return lines.join('\n');
 }
+
+// Build ESC/POS bytes for a single QRIS merchant standee card
+export function buildQrisStandeeReceipt(
+  merchant: QrisMerchantAccount,
+  settings: StoreSettings
+): EscPosBuilder {
+  const cols = settings.paperWidth === '80mm' ? 48 : 32;
+  const builder = new EscPosBuilder();
+
+  // Standee Header
+  builder.alignCenter();
+  builder.bold(true);
+  builder.line('================================'.slice(0, cols));
+  builder.line('QRIS PEMBAYARAN RESMI');
+  builder.bold(false);
+  builder.line('STAND SCAN MEJA KASIR');
+  builder.divider(cols, '=');
+
+  // Merchant Information
+  builder.feed(1);
+  builder.bold(true);
+  builder.line(merchant.merchantName.toUpperCase());
+  builder.bold(false);
+  if (merchant.notes) {
+    builder.line(`[ ${merchant.notes} ]`);
+  }
+  builder.feed(1);
+
+  // Big QR Code
+  // Size 6 for 58mm, size 8 for 80mm
+  const qrSize = settings.paperWidth === '80mm' ? 8 : 6;
+  builder.qrCode(merchant.qrisPayload, qrSize);
+  builder.feed(1);
+
+  // Scan Notice
+  builder.bold(true);
+  builder.line('[ SCAN UNTUK BAYAR ]');
+  builder.bold(false);
+  builder.feed(1);
+
+  // Details
+  builder.alignLeft();
+  builder.divider(cols, '-');
+  builder.twoColumn('NMID', merchant.nmid || '-', cols);
+  builder.twoColumn('ACQUIRER', merchant.acquirer || 'QRIS NASIONAL', cols);
+  if (merchant.city) {
+    builder.twoColumn('KOTA', merchant.city, cols);
+  }
+  builder.twoColumn('TIPE QRIS', 'STATIS (NOMINAL BEBAS)', cols);
+  builder.divider(cols, '-');
+
+  // Accepted payment methods
+  builder.alignCenter();
+  builder.line('MENERIMA SEMUA PEMBAYARAN:');
+  builder.line('BCA, Mandiri, BRI, BNI, BSI');
+  builder.line('DANA, OVO, GoPay, ShopeePay, LinkAja');
+  builder.line('& Seluruh Aplikasi Mobile Banking');
+  builder.divider(cols, '=');
+  builder.line(settings.storeName.toUpperCase());
+  if (settings.phone) {
+    builder.line(`WA/CS: ${settings.phone}`);
+  }
+  builder.feed(3);
+  builder.cut();
+
+  return builder;
+}
+
+// Build ESC/POS bytes for all saved QRIS merchant standees in one batch print job
+export function buildAllQrisStandeesReceipt(
+  merchants: QrisMerchantAccount[],
+  settings: StoreSettings
+): EscPosBuilder {
+  const cols = settings.paperWidth === '80mm' ? 48 : 32;
+  const builder = new EscPosBuilder();
+
+  // Banner intro
+  builder.alignCenter();
+  builder.bold(true);
+  builder.line('================================'.slice(0, cols));
+  builder.line('BATCH CETAK BARCODE QRIS TOKO');
+  builder.line(`TOTAL: ${merchants.length} AKUN MERCHANT`);
+  builder.bold(false);
+  builder.line(settings.storeName.toUpperCase());
+  builder.line('================================'.slice(0, cols));
+  builder.feed(1);
+
+  merchants.forEach((m, idx) => {
+    builder.alignCenter();
+    builder.divider(cols, '*');
+    builder.bold(true);
+    builder.line(`[ AKUN QRIS #${idx + 1} DARI ${merchants.length} ]`);
+    builder.line(m.merchantName.toUpperCase());
+    builder.bold(false);
+    if (m.notes) builder.line(`[ ${m.notes} ]`);
+    builder.feed(1);
+
+    const qrSize = settings.paperWidth === '80mm' ? 8 : 6;
+    builder.qrCode(m.qrisPayload, qrSize);
+    builder.feed(1);
+
+    builder.bold(true);
+    builder.line('[ SCAN UNTUK BAYAR ]');
+    builder.bold(false);
+
+    builder.alignLeft();
+    builder.divider(cols, '-');
+    builder.twoColumn('NMID', m.nmid || '-', cols);
+    builder.twoColumn('ACQUIRER', m.acquirer || 'QRIS NASIONAL', cols);
+    if (m.city) builder.twoColumn('KOTA', m.city, cols);
+    builder.divider(cols, '-');
+    builder.feed(2);
+  });
+
+  builder.alignCenter();
+  builder.divider(cols, '=');
+  builder.bold(true);
+  builder.line('SELESAI CETAK SEMUA QRIS');
+  builder.bold(false);
+  builder.line('Gunting garis pembatas untuk dipajang');
+  builder.line('================================'.slice(0, cols));
+  builder.feed(3);
+  builder.cut();
+
+  return builder;
+}
+
+// Plain text format for single standee card (for WhatsApp / sharing)
+export function generateQrisStandeePlainText(
+  merchant: QrisMerchantAccount,
+  settings: StoreSettings
+): string {
+  const lines: string[] = [];
+  lines.push('================================');
+  lines.push('🏷️ *QRIS PEMBAYARAN RESMI*');
+  lines.push(`*${merchant.merchantName.toUpperCase()}*`);
+  if (merchant.notes) lines.push(`_${merchant.notes}_`);
+  lines.push('================================');
+  lines.push(`NMID     : ${merchant.nmid || '-'}`);
+  lines.push(`Acquirer : ${merchant.acquirer || 'QRIS'}`);
+  if (merchant.city) lines.push(`Kota     : ${merchant.city}`);
+  lines.push('Tipe     : QRIS Statis Toko');
+  lines.push('--------------------------------');
+  lines.push('📲 *Kode Payload QRIS:*');
+  lines.push(`\`\`\`${merchant.qrisPayload}\`\`\``);
+  lines.push('--------------------------------');
+  lines.push('Menerima Pembayaran:');
+  lines.push('BCA, Mandiri, BRI, BNI, DANA, OVO, GoPay, ShopeePay & Semua Bank');
+  lines.push('================================');
+  lines.push(settings.storeName.toUpperCase());
+  return lines.join('\n');
+}
+
